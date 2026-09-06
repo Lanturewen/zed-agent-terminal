@@ -13,8 +13,20 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const TITLE_MAX_LEN = 35;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-// U+F101 is the official pi-acp.svg compiled into ~/Library/Fonts/AgentIcons.ttf
-const AGENT_ICON = "\uF101";
+function isZedTerminal(): boolean {
+  return (
+    process.env.TERM_PROGRAM === "zed" ||
+    process.env.ZED_TERM === "true" ||
+    process.env.ZED_ENVIRONMENT === "worktree-shell"
+  );
+}
+
+// U+F101 is in AgentIcons.ttf, which is configured in Zed font fallbacks.
+// In external terminals (Apple Terminal, Warp, iTerm2), omit it to prevent [?] tofu.
+function getAgentIconPrefix(): string {
+  if (process.env.AGENT_TERM_FORCE_ICON === "1") return "\uF101 ";
+  return isZedTerminal() ? "\uF101 " : "";
+}
 
 export function cleanTitle(text: string | null | undefined): string | null {
   if (!text) return null;
@@ -138,7 +150,8 @@ export default function (pi: ExtensionAPI) {
     activeTimer = setInterval(() => {
       const frame = SPINNER_FRAMES[frameIdx % SPINNER_FRAMES.length];
       frameIdx++;
-      const title = `${AGENT_ICON} ${frame} ${baseTitle}`;
+      const icon = getAgentIconPrefix();
+      const title = `${icon}${frame} ${baseTitle}`;
       sendTerminalTitle(title);
       ctx.ui.setTitle(title);
     }, 80);
@@ -146,7 +159,8 @@ export default function (pi: ExtensionAPI) {
 
   function setCleanTitle(ctx: ExtensionContext) {
     stopAnimation();
-    const title = `${AGENT_ICON} ${baseTitle}`;
+    const icon = getAgentIconPrefix();
+    const title = `${icon}${baseTitle}`;
     sendTerminalTitle(title);
     ctx.ui.setTitle(title);
   }

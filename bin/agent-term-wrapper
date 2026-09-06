@@ -224,6 +224,13 @@ def set_title(title: str):
         sys.stdout.write(f"\x1b]0;{title}\x07")
         sys.stdout.flush()
 
+def is_zed_terminal() -> bool:
+    return (
+        os.environ.get("TERM_PROGRAM") == "zed"
+        or os.environ.get("ZED_TERM") == "true"
+        or os.environ.get("ZED_ENVIRONMENT") == "worktree-shell"
+    )
+
 def compose_title(icon: str, text: str) -> str:
     """Avoid a leading blank when a host owns the icon separately."""
     return f"{icon} {text}" if icon else text
@@ -236,6 +243,11 @@ def main():
     icon = sys.argv[1]
     default_name = sys.argv[2]
     cmd_args = sys.argv[3:]
+
+    # Custom PUA icons (U+F101..U+F105) are only configured in Zed font fallbacks.
+    # In external terminals (Apple Terminal, Warp, iTerm2), omit PUA icon to avoid [?] tofu.
+    if not is_zed_terminal() and os.environ.get("AGENT_TERM_FORCE_ICON", "") not in {"1", "true", "yes"}:
+        icon = ""
 
     # Ensure Claude Code does not overwrite the wrapper title
     if cmd_args and "claude" in os.path.basename(cmd_args[0]).lower():

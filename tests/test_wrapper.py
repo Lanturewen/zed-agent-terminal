@@ -80,6 +80,20 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(module.clean_title("[200~你是什么模型[201~"), "你是什么模型")
         self.assertEqual(module.clean_title("分析 2026 年年报"), "分析 2026 年年报")
 
+    def test_is_zed_terminal_detection(self):
+        import os
+        orig = dict(os.environ)
+        try:
+            os.environ["TERM_PROGRAM"] = "zed"
+            self.assertTrue(module.is_zed_terminal())
+            os.environ["TERM_PROGRAM"] = "Apple_Terminal"
+            os.environ.pop("ZED_TERM", None)
+            os.environ.pop("ZED_ENVIRONMENT", None)
+            self.assertFalse(module.is_zed_terminal())
+        finally:
+            os.environ.clear()
+            os.environ.update(orig)
+
 
 if __name__ == "__main__":
     unittest.main()
