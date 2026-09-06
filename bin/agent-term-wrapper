@@ -237,6 +237,10 @@ def main():
     default_name = sys.argv[2]
     cmd_args = sys.argv[3:]
 
+    # Ensure Claude Code does not overwrite the wrapper title
+    if cmd_args and "claude" in os.path.basename(cmd_args[0]).lower():
+        os.environ["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
+
     # Check if CLI launched with an initial prompt argument
     initial_prompt = extract_cli_prompt(cmd_args)
     has_custom_title = bool(initial_prompt)
