@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+*.zed-agent.bak
+.DS_Store
+*.tar.gz
+*.sha256

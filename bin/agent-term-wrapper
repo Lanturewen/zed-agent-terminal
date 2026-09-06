@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+Unified Agent Terminal Wrapper for Zed & macOS Terminals.
+- Automatically captures the user's first prompt as the session title (e.g. "你是什么模型").
+- While the agent is running/generating, animates ` ⠋` in the window title.
+- When the agent finishes output and returns to the prompt, stops the spinner and restores the clean title.
+- Seamlessly handles terminal resizing (SIGWINCH) and raw TTY modes.
+"""
+
+import codecs
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
+
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+TITLE_MAX_LEN = 35
+
+class TitleInputFilter:
+    """Filter stdin bytes to extract only human text for session title capture.
+    Strips all ANSI escape sequences, CSI mode reports (DECRPM), CPR/DA replies,
+    bracketed paste tags, and control sequences without losing split chunks."""
+    STATE_NORMAL = 0
+    STATE_ESC = 1
+    STATE_CSI = 2
+    STATE_OSC = 3
+    STATE_SS3 = 4
+    STATE_DCS = 5
+    STATE_OSC_ESC = 6
+    STATE_DCS_ESC = 7
+
+    def __init__(self):
+        self.state = self.STATE_NORMAL
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        for b in data:
+            if self.state == self.STATE_NORMAL:
+                if b == 0x1b:
+                    self.state = self.STATE_ESC
+                else:
+                    out.append(b)
+            elif self.state == self.STATE_ESC:
+                if b == ord("["):
+                    self.state = self.STATE_CSI
+                elif b == ord("]"):
+                    self.state = self.STATE_OSC
+                elif b == ord("O"):
+                    self.state = self.STATE_SS3
+                elif b in (ord("P"), ord("_"), ord("^")):
+                    self.state = self.STATE_DCS
+                else:
+                    self.state = self.STATE_NORMAL
+            elif self.state == self.STATE_CSI:
+                if 0x40 <= b <= 0x7e:
+                    self.state = self.STATE_NORMAL
+            elif self.state == self.STATE_SS3:
+                self.state = self.STATE_NORMAL
+            elif self.state == self.STATE_OSC:
+                if b == 0x07:
+                    self.state = self.STATE_NORMAL
+                elif b == 0x1b:
+                    self.state = self.STATE_OSC_ESC
+            elif self.state == self.STATE_OSC_ESC:
+                if b == ord("\\"):
+                    self.state = self.STATE_NORMAL
+                else:
+                    self.state = self.STATE_OSC
+            elif self.state == self.STATE_DCS:
+                if b == 0x07:
+                    self.state = self.STATE_NORMAL
+                elif b == 0x1b:
+                    self.state = self.STATE_DCS_ESC
+            elif self.state == self.STATE_DCS_ESC:
+                if b == ord("\\"):
+                    self.state = self.STATE_NORMAL
+                else:
+                    self.state = self.STATE_DCS
+        return bytes(out)
+
+class TerminalQueryFilter:
+    """Remove terminal query traffic without losing split PTY chunks."""
+
+    def __init__(self, drop_titles: bool = False):
+        self.pending = bytearray()
+        self.drop_titles = drop_titles
+
+    def feed(self, data: bytes) -> bytes:
+        self.pending.extend(data)
+        src = bytes(self.pending)
+        out = bytearray()
+        i = 0
+        while i < len(src):
+            if src[i] != 0x1b:
+                out.append(src[i])
+                i += 1
+                continue
+            if i + 1 >= len(src):
+                break
+            kind = src[i + 1]
+            if kind == ord("["):
+                end = i + 2
+                while end < len(src) and not (0x40 <= src[end] <= 0x7e):
+                    end += 1
+                if end >= len(src):
+                    break
+                # CPR/device-status/mode replies are host responses, never display data.
+                if src[end] in (ord("c"), ord("R"), ord("y")):
+                    i = end + 1
+                    continue
+                out.extend(src[i:end + 1])
+                i = end + 1
+                continue
+            if kind == ord("]"):
+                end = i + 2
+                while end < len(src) and src[end] not in (0x07, 0x1b):
+                    end += 1
+                if end >= len(src):
+                    break
+                terminator_len = 2 if src[end] == 0x1b and end + 1 < len(src) and src[end + 1] == ord("\\") else 1
+                payload = src[i + 2:end]
+                # OSC 10/11/12 are terminal color/cursor queries and responses.
+                # OSC 0/1/2 are window/icon title updates. The output-side
+                # filter drops those because Codex otherwise overwrites the
+                # stable wrapper title with the workspace name.
+                query_reply = payload.startswith((b"10;", b"11;", b"12;"))
+                title_update = self.drop_titles and payload.startswith((b"0;", b"1;", b"2;"))
+                if query_reply or title_update:
+                    i = end + terminator_len
+                    continue
+                out.extend(src[i:end + terminator_len])
+                i = end + terminator_len
+                continue
+            out.append(src[i])
+            i += 1
+        self.pending = bytearray(src[i:])
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        data = bytes(self.pending)
+        self.pending.clear()
+        return data
+
+def clean_title(text: str) -> str:
+    if not text:
+        return ""
+    # Strip ANSI escape sequences (ECMA-48 CSI, OSC, etc.)
+    text = re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\))", "", text)
+    # Strip bracketed paste markers
+    text = re.sub(r"\[?20[01]~", "", text)
+    # Strip DECRPM / DEC private mode query responses (e.g. ?2026;2$y or [?2027;0$y)
+    text = re.sub(r"\[?\?\d+(?:;\d+)*\$?[a-zA-Z]", "", text)
+    # Strip CPR responses (e.g. [24;1R or 24;1R)
+    text = re.sub(r"\[?\d+;\d+R", "", text)
+    # Strip DA responses (e.g. [?1;2c or ?1;2c)
+    text = re.sub(r"\[?\?\d+(?:;\d+)*c", "", text)
+    # Strip non-printable control characters
+    text = "".join(ch for ch in text if ch >= " " or ch == "\t")
+    text = " ".join(text.split())
+    # Ignore slash commands like /help, /exit, /model
+    if text.startswith("/"):
+        return ""
+    if len(text) > TITLE_MAX_LEN:
+        return text[:TITLE_MAX_LEN].rstrip() + "…"
+    return text
+
+def extract_cli_prompt(cmd_args: list[str]) -> str:
+    """Extract a user prompt without treating CLI subcommands or product names as title text."""
+    if len(cmd_args) < 2:
+        return ""
+
+    executable = os.path.basename(cmd_args[0]).lower()
+    is_codex = executable in {"codex", "codex.exe"}
+    is_claude = executable in {"claude", "claude.exe"}
+
+    start = 1
+    if start < len(cmd_args):
+        first_arg = cmd_args[start].lower()
+        if is_codex and first_arg in {"exec", "e"}:
+            start += 1
+        elif is_claude and first_arg in {"code", "chat"}:
+            start += 1
+
+    value_options = {"--print", "--prompt", "-i", "--prompt-interactive"}
+    if not is_codex:
+        value_options.add("-p")
+    flag_options = {
+        "-m", "--model", "-s", "--sandbox", "-a", "--ask-for-approval",
+        "-C", "--cd", "--add-dir", "-p", "--profile", "-c", "--config",
+        "--enable", "--disable", "--remote", "--remote-auth-token-env",
+    }
+    if is_codex:
+        flag_options.add("-p")
+
+    i = start
+    while i < len(cmd_args):
+        a = cmd_args[i]
+        if a == "--":
+            if i + 1 < len(cmd_args):
+                return clean_title(cmd_args[i + 1])
+            break
+        if a in value_options and i + 1 < len(cmd_args):
+            return clean_title(cmd_args[i + 1])
+        if a in flag_options:
+            i += 2
+            continue
+        if a.startswith("-") or a.startswith("/"):
+            i += 1
+            continue
+        if len(a) > 1:
+            return clean_title(a)
+        i += 1
+    return ""
+
+def set_title(title: str):
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\x1b]0;{title}\x07")
+        sys.stdout.flush()
+
+def compose_title(icon: str, text: str) -> str:
+    """Avoid a leading blank when a host owns the icon separately."""
+    return f"{icon} {text}" if icon else text
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: agent-term-wrapper <icon> <name> <command> [args...]", file=sys.stderr)
+        sys.exit(1)
+
+    icon = sys.argv[1]
+    default_name = sys.argv[2]
+    cmd_args = sys.argv[3:]
+
+    # Check if CLI launched with an initial prompt argument
+    initial_prompt = extract_cli_prompt(cmd_args)
+    has_custom_title = bool(initial_prompt)
+    current_name = initial_prompt if initial_prompt else default_name
+
+    idle_title = compose_title(icon, current_name)
+    set_title(idle_title)
+
+    # Full-screen TUIs such as Codex redraw their own terminal state and can
+    # conflict with an 80ms OSC title animation. Keep a stable title for them.
+    spinner_enabled = os.environ.get("AGENT_TERM_NO_SPINNER", "") not in {"1", "true", "yes"}
+
+    # A one-shot prompt starts running as soon as the child starts. Interactive
+    # sessions transition to running when the user submits a line below.
+    is_running = bool(initial_prompt)
+    last_output_time = 0.0
+    had_output_since_enter = bool(initial_prompt)
+    input_chars: list[str] = []
+
+    lock = threading.Lock()
+    stop_event = threading.Event()
+    frame_idx = 0
+    input_filter = TitleInputFilter()
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+    display_filter = TerminalQueryFilter(drop_titles=True)
+
+    def spinner_worker():
+        nonlocal frame_idx
+        while not stop_event.is_set():
+            with lock:
+                running = is_running
+                name_for_title = current_name
+            if running and spinner_enabled:
+                frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+                frame_idx += 1
+                set_title(compose_title(icon, f"{frame} {name_for_title}"))
+            time.sleep(0.08)
+
+    th = threading.Thread(target=spinner_worker, daemon=True)
+    th.start()
+
+    old_term = None
+    if sys.stdin.isatty():
+        try:
+            old_term = termios.tcgetattr(sys.stdin)
+        except Exception:
+            old_term = None
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # Child process
+        os.execvp(cmd_args[0], cmd_args)
+
+    # Parent process
+    def sync_winsize():
+        try:
+            if sys.stdin.isatty():
+                ws = fcntl.ioctl(sys.stdin, termios.TIOCGWINSZ, b"\x00" * 8)
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, ws)
+        except Exception:
+            pass
+
+    def on_winch(signum, frame):
+        sync_winsize()
+
+    signal.signal(signal.SIGWINCH, on_winch)
+    sync_winsize()
+
+    if old_term:
+        tty.setraw(sys.stdin)
+
+    try:
+        while True:
+            rlist = [master_fd]
+            if sys.stdin.isatty():
+                rlist.append(sys.stdin.fileno())
+
+            timeout = 0.08 if is_running else 0.4
+            r, _, _ = select.select(rlist, [], [], timeout)
+
+            now = time.time()
+            with lock:
+                if is_running and had_output_since_enter:
+                    # If 400ms have elapsed without any new output from the agent, turn is complete
+                    if now - last_output_time > 0.4:
+                        is_running = False
+                        had_output_since_enter = False
+                        set_title(idle_title)
+
+            for fd in r:
+                if fd == master_fd:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        return
+                    # Keep the child's PTY bytes intact, but do not display
+                    # terminal capability replies if the host leaks them.
+                    display_data = display_filter.feed(data)
+                    if display_data:
+                        os.write(sys.stdout.fileno(), display_data)
+                    with lock:
+                        last_output_time = time.time()
+                        if is_running:
+                            had_output_since_enter = True
+
+                elif fd == sys.stdin.fileno():
+                    try:
+                        inp = os.read(sys.stdin.fileno(), 1024)
+                    except OSError:
+                        inp = b""
+                    if not inp:
+                        return
+
+                    # Decode only human input for title capture. Terminal query
+                    # replies still pass through unchanged to the child PTY.
+                    title_input = input_filter.feed(inp)
+                    try:
+                        text = utf8_decoder.decode(title_input)
+                    except Exception:
+                        text = ""
+
+                    for ch in text:
+                        if ch in ("\r", "\n"):
+                            typed_str = "".join(input_chars).strip()
+                            input_chars.clear()
+                            if not has_custom_title:
+                                captured = clean_title(typed_str)
+                                if captured:
+                                    has_custom_title = True
+                                    with lock:
+                                        current_name = captured
+                                        idle_title = compose_title(icon, current_name)
+                            with lock:
+                                is_running = True
+                                had_output_since_enter = False
+                                last_output_time = time.time()
+                        elif ch in ("\x7f", "\x08"):
+                            if input_chars:
+                                input_chars.pop()
+                        elif ch in ("\x03", "\x15"):  # Ctrl+C or Ctrl+U
+                            input_chars.clear()
+                        elif ch >= " " and ch != "\x1b":
+                            input_chars.append(ch)
+
+                    os.write(master_fd, inp)
+
+    finally:
+        stop_event.set()
+        if old_term:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        set_title(os.path.basename(os.getcwd()))
+
+if __name__ == "__main__":
+    main()

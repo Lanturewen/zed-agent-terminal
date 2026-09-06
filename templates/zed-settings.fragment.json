@@ -1,0 +1,7 @@
+{
+  "terminal": {
+    "font_fallbacks": ["AgentIcons"]
+  },
+  "ui_font_fallbacks": ["AgentIcons"],
+  "buffer_font_fallbacks": ["AgentIcons"]
+}

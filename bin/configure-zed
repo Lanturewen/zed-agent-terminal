@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+Safely configure AgentIcons font fallbacks in Zed settings.json without
+losing comments or existing configurations.
+"""
+
+import os
+import re
+import sys
+
+DEFAULT_FRAGMENT = """{
+  "terminal": {
+    "font_fallbacks": ["AgentIcons"]
+  },
+  "ui_font_fallbacks": ["AgentIcons"],
+  "buffer_font_fallbacks": ["AgentIcons"]
+}
+"""
+
+def update_zed_content(content: str) -> tuple[str, bool]:
+    has_ui = "ui_font_fallbacks" in content and "AgentIcons" in content
+    has_buf = "buffer_font_fallbacks" in content and "AgentIcons" in content
+    has_term = False
+    term_m = re.search(r'"terminal"\s*:\s*\{([^}]*)\}', content)
+    if term_m and "font_fallbacks" in term_m.group(1) and "AgentIcons" in term_m.group(1):
+        has_term = True
+
+    if has_ui and has_buf and has_term:
+        return content, False
+
+    modified = content
+
+    # 1. ui_font_fallbacks
+    if "ui_font_fallbacks" in modified:
+        m = re.search(r'("ui_font_fallbacks"\s*:\s*\[)([^\]]*)(\])', modified)
+        if m and "AgentIcons" not in m.group(2):
+            inner = m.group(2).strip()
+            new_inner = f'"AgentIcons", {inner}' if inner else '"AgentIcons"'
+            modified = modified[:m.start(2)] + new_inner + modified[m.end(2):]
+    else:
+        modified = re.sub(r'(\{\s*)', r'\1  "ui_font_fallbacks": ["AgentIcons"],\n', modified, count=1)
+
+    # 2. buffer_font_fallbacks
+    if "buffer_font_fallbacks" in modified:
+        m = re.search(r'("buffer_font_fallbacks"\s*:\s*\[)([^\]]*)(\])', modified)
+        if m and "AgentIcons" not in m.group(2):
+            inner = m.group(2).strip()
+            new_inner = f'"AgentIcons", {inner}' if inner else '"AgentIcons"'
+            modified = modified[:m.start(2)] + new_inner + modified[m.end(2):]
+    else:
+        modified = re.sub(r'(\{\s*)', r'\1  "buffer_font_fallbacks": ["AgentIcons"],\n', modified, count=1)
+
+    # 3. terminal.font_fallbacks
+    term_m = re.search(r'"terminal"\s*:\s*\{([^}]*)\}', modified)
+    if term_m:
+        term_body = term_m.group(1)
+        if "font_fallbacks" in term_body:
+            fb_m = re.search(r'("font_fallbacks"\s*:\s*\[)([^\]]*)(\])', term_body)
+            if fb_m and "AgentIcons" not in fb_m.group(2):
+                inner = fb_m.group(2).strip()
+                new_inner = f'"AgentIcons", {inner}' if inner else '"AgentIcons"'
+                new_term_body = term_body[:fb_m.start(2)] + new_inner + term_body[fb_m.end(2):]
+                modified = modified[:term_m.start(1)] + new_term_body + modified[term_m.end(1):]
+        else:
+            new_term_body = '\n    "font_fallbacks": ["AgentIcons"],' + term_body
+            modified = modified[:term_m.start(1)] + new_term_body + modified[term_m.end(1):]
+    else:
+        modified = re.sub(r'(\{\s*)', r'\1  "terminal": {\n    "font_fallbacks": ["AgentIcons"]\n  },\n', modified, count=1)
+
+    return modified, True
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    home = os.environ.get("HOME", os.path.expanduser("~"))
+    settings_dir = os.path.join(home, ".config", "zed")
+    settings_path = os.path.join(settings_dir, "settings.json")
+
+    if not os.path.exists(settings_path):
+        if dry_run:
+            print(f"[dry-run] Would create {settings_path} with default AgentIcons fallbacks.")
+            return
+        os.makedirs(settings_dir, exist_ok=True)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            f.write(DEFAULT_FRAGMENT)
+        print(f"Created {settings_path} with AgentIcons font fallbacks.")
+        return
+
+    with open(settings_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    new_content, changed = update_zed_content(content)
+    if not changed:
+        print("Zed settings already include AgentIcons font fallbacks. Nothing to do.")
+        return
+
+    if dry_run:
+        print(f"[dry-run] Would update {settings_path} to include AgentIcons fallbacks.")
+        return
+
+    # Backup existing settings
+    backup_path = settings_path + ".zed-agent.bak"
+    if not os.path.exists(backup_path):
+        with open(backup_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"Backup created at {backup_path}")
+
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    print(f"Successfully updated {settings_path} with AgentIcons font fallbacks.")
+
+if __name__ == "__main__":
+    main()
