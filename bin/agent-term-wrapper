@@ -111,8 +111,16 @@ class TerminalQueryFilter:
                     end += 1
                 if end >= len(src):
                     break
+                params = src[i + 2:end]
                 # CPR/device-status/mode replies are host responses, never display data.
-                if src[end] in (ord("c"), ord("R"), ord("y")):
+                # Notice: \x1b[c / \x1b[0c is a DA query from the app to the terminal.
+                # A DA response from the terminal ALWAYS contains '?' (e.g. \x1b[?62;1;2c).
+                # A CPR response contains ';' (e.g. \x1b[24;1R).
+                # A DECRPM response contains '$' (e.g. \x1b[?2026;2$y).
+                is_da_resp = src[end] == ord("c") and b"?" in params
+                is_cpr_resp = src[end] == ord("R") and b";" in params
+                is_mode_resp = src[end] == ord("y") and b"$" in params
+                if is_da_resp or is_cpr_resp or is_mode_resp:
                     i = end + 1
                     continue
                 out.extend(src[i:end + 1])
@@ -126,11 +134,12 @@ class TerminalQueryFilter:
                     break
                 terminator_len = 2 if src[end] == 0x1b and end + 1 < len(src) and src[end + 1] == ord("\\") else 1
                 payload = src[i + 2:end]
-                # OSC 10/11/12 are terminal color/cursor queries and responses.
+                # OSC 10/11/12 queries (e.g. 10;?, 11;?) must pass through to the terminal.
                 # OSC 0/1/2 are window/icon title updates. The output-side
                 # filter drops those because Codex otherwise overwrites the
                 # stable wrapper title with the workspace name.
-                query_reply = payload.startswith((b"10;", b"11;", b"12;"))
+                is_query = payload.startswith((b"10;", b"11;", b"12;")) and payload.endswith(b"?")
+                query_reply = not is_query and payload.startswith((b"10;", b"11;"))
                 title_update = self.drop_titles and payload.startswith((b"0;", b"1;", b"2;"))
                 if query_reply or title_update:
                     i = end + terminator_len

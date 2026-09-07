@@ -37,6 +37,18 @@ class WrapperTests(unittest.TestCase):
         filt = module.TerminalQueryFilter()
         self.assertEqual(filt.feed(b"hello\x1b]10;rgb:d1d1/d7d7/dada\x07\r"), b"hello\r")
         self.assertEqual(filt.feed(b"\x1b[2;1Rworld"), b"world")
+        self.assertEqual(filt.feed(b"\x1b[?62;1;2c"), b"")
+        self.assertEqual(filt.feed(b"\x1b[?2026;2$y"), b"")
+
+    def test_query_filter_preserves_app_queries(self):
+        filt = module.TerminalQueryFilter(drop_titles=True)
+        # DA1 device attributes queries
+        self.assertEqual(filt.feed(b"\x1b[c"), b"\x1b[c")
+        self.assertEqual(filt.feed(b"\x1b[0c"), b"\x1b[0c")
+        # Color queries
+        self.assertEqual(filt.feed(b"\x1b]10;?\x07"), b"\x1b]10;?\x07")
+        self.assertEqual(filt.feed(b"\x1b]11;?\x07"), b"\x1b]11;?\x07")
+        self.assertEqual(filt.feed(b"\x1b]11;?\x1b\\"), b"\x1b]11;?\x1b\\")
 
     def test_query_filter_handles_split_sequence(self):
         filt = module.TerminalQueryFilter()
